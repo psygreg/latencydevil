@@ -10,14 +10,17 @@
 //!
 //! Because flatpak sandboxes drop foreign environment variables, `flatpak run
 //! <app>` is detected automatically and the variables are forwarded with
-//! `--env=KEY=VALUE` flags instead. Everything else is plain `setenv` + `exec`,
-//! so the wrapper never lingers in the process tree.
+//! `--env=KEY=VALUE` flags instead. When `gamemoderun` is found on PATH the
+//! command is additionally wrapped with it (GameMode handles the process
+//! priorities); without it, the variables alone are injected. Everything else
+//! is plain `setenv` + `exec`, so the wrapper never lingers in the process
+//! tree.
 
 use std::{
     env, fs,
     io::ErrorKind,
     os::unix::process::CommandExt,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
 
@@ -49,6 +52,10 @@ GPUs preferred) and replaces itself with COMMAND.
   NVIDIA GPU present: adds LOW_LATENCY_LAYER_REFLEX=1
                       and DXVK_CONFIG=\"dxgi.hideAmdGpu = True\" (merged into an
                       existing DXVK_CONFIG)
+  GameMode:           if `gamemoderun` is on PATH the command runs as
+                      `gamemoderun COMMAND` (a command already starting with
+                      gamemoderun is kept as-is); without it, only the
+                      variables above are injected.
 
 options:
   --print       print the variables that would be set, then exit
@@ -111,6 +118,14 @@ fn dispatch(argv: &[std::ffi::OsString]) -> Result<ExitCode, String> {
     let nvidia = gpus.iter().any(|gpu| gpu.vendor == Vendor::Nvidia);
     let vars = build_vars(&gpus);
 
+    let flatpak_detected = flatpak_run_index(child_argv).is_some();
+    let gamemode_on_path = find_gamemoderun();
+    let child_starts_gamemode = child_argv
+        .first()
+        .and_then(|arg| base_name(arg))
+        .as_deref()
+        == Some("gamemoderun");
+
     if debug {
         if gpus.is_empty() {
             eprintln!("[latencydevil] no GPUs found in {SYSFS_PCI}; applying the universal variables only");
@@ -129,9 +144,27 @@ fn dispatch(argv: &[std::ffi::OsString]) -> Result<ExitCode, String> {
         for (key, value) in &vars {
             eprintln!("[latencydevil] set {key}={value}");
         }
+        if flatpak_detected {
+            eprintln!("[latencydevil] flatpak run detected: variables forwarded with --env=");
+        }
+        eprintln!("[latencydevil] gamemoderun on PATH: {gamemode_on_path}");
+        eprintln!(
+            "[latencydevil] gamemode wrap: {}",
+            gamemode_on_path && !child_starts_gamemode
+        );
     }
 
     if print_only {
+        if flatpak_detected {
+            println!("# flatpak run detected: variables forwarded with --env=");
+        }
+        match (gamemode_on_path, child_starts_gamemode) {
+            (_, true) => println!("# gamemoderun: command is already wrapped, not double-wrapping"),
+            (true, false) => {
+                println!("# gamemoderun: found, the command will run as `gamemoderun COMMAND`")
+            }
+            (false, false) => println!("# gamemoderun: not found on PATH, only injecting variables"),
+        }
         for (key, value) in &vars {
             println!("{key}={value}");
         }
@@ -142,8 +175,10 @@ fn dispatch(argv: &[std::ffi::OsString]) -> Result<ExitCode, String> {
         return Err("no command to run; try `latencydevil --help`".into());
     }
 
-    let final_argv = inject_flatpak_env(child_argv, &vars)
-        .unwrap_or_else(|| child_argv.to_vec());
+    let final_argv = maybe_wrap_gamemode(
+        inject_flatpak_env(child_argv, &vars).unwrap_or_else(|| child_argv.to_vec()),
+        gamemode_on_path,
+    );
     if debug {
         eprintln!("[latencydevil] exec: {}", format_command(&final_argv));
     }
@@ -249,25 +284,93 @@ fn merge_dxvk_config<'a>(extra: &'a str, existing: Option<&str>) -> String {
 
 /// `flatpak run` drops foreign environment variables at the sandbox border.
 /// Detect that invocation shape and forward the variables with
-/// `--env=KEY=VALUE` after `run` (before any user-supplied options),
+/// `--env=KEY=VALUE` right after `run` (before any user-supplied options),
 /// returning the rewritten argument vector (program first), or `None`.
+/// The shape is matched by basename so absolute paths work; a user-provided
+/// leading `gamemoderun` is looked through.
 fn inject_flatpak_env(
     child_argv: &[std::ffi::OsString],
     vars: &[(String, String)],
 ) -> Option<Vec<std::ffi::OsString>> {
-    if child_argv.len() < 2
-        || child_argv[0].as_os_str() != std::ffi::OsStr::new("flatpak")
-        || child_argv[1].as_os_str() != std::ffi::OsStr::new("run")
-    {
-        return None;
-    }
+    let run_index = flatpak_run_index(child_argv)?;
     let mut argv: Vec<std::ffi::OsString> = Vec::with_capacity(vars.len() * 2 + child_argv.len());
-    argv.extend_from_slice(&child_argv[..2]);
+    argv.extend_from_slice(&child_argv[..run_index]);
     for (key, value) in vars {
         argv.push(format!("--env={key}={value}").into());
     }
-    argv.extend_from_slice(&child_argv[2..]);
+    argv.extend_from_slice(&child_argv[run_index..]);
     Some(argv)
+}
+
+/// Index of the element right after `run` for the shapes `flatpak run ...`
+/// and `gamemoderun flatpak run ...`, or `None` otherwise.
+fn flatpak_run_index(child_argv: &[std::ffi::OsString]) -> Option<usize> {
+    match child_argv.len() {
+        len if len >= 2
+            && arg_base_name(child_argv, 0) == Some("flatpak")
+            && arg_base_name(child_argv, 1) == Some("run") =>
+        {
+            Some(2)
+        }
+        len if len >= 3
+            && arg_base_name(child_argv, 0) == Some("gamemoderun")
+            && arg_base_name(child_argv, 1) == Some("flatpak")
+            && arg_base_name(child_argv, 2) == Some("run") =>
+        {
+            Some(3)
+        }
+        _ => None,
+    }
+}
+
+/// File name of `argv[index]`, borrowed from the slice so it stays valid in
+/// match guards. Non-UTF8 names compare as `None`, which never matches.
+fn arg_base_name(argv: &[std::ffi::OsString], index: usize) -> Option<&str> {
+    Path::new(argv.get(index)?)
+        .file_name()?
+        .to_str()
+}
+
+/// File name of an argument, tolerating absolute paths.
+fn base_name(arg: &std::ffi::OsStr) -> Option<String> {
+    Path::new(arg)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+}
+
+/// Prepend `gamemoderun` when it is available, unless the command is already
+/// wrapped with it (prevents double-wrapping).
+fn maybe_wrap_gamemode(
+    mut argv: Vec<std::ffi::OsString>,
+    gamemode_on_path: bool,
+) -> Vec<std::ffi::OsString> {
+    let starts_with_gamemoderun =
+        argv.first().and_then(|arg| base_name(arg)).as_deref() == Some("gamemoderun");
+    if gamemode_on_path && !starts_with_gamemoderun {
+        argv.insert(0, "gamemoderun".into());
+    }
+    argv
+}
+
+/// Whether `gamemoderun` is an executable file on PATH.
+fn find_gamemoderun() -> bool {
+    let dirs: Vec<PathBuf> = env::var_os("PATH")
+        .map(|path| env::split_paths(&path).collect())
+        .unwrap_or_default();
+    find_binary_in(&dirs, "gamemoderun")
+}
+
+fn find_binary_in(dirs: &[PathBuf], binary: &str) -> bool {
+    dirs.iter()
+        .any(|dir| is_executable_file(&dir.join(binary)))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
 fn format_command(argv: &[std::ffi::OsString]) -> String {
@@ -416,5 +519,69 @@ mod tests {
         for case in cases {
             assert!(inject_flatpak_env(&case, &vars).is_none(), "case: {case:#?}");
         }
+    }
+
+    #[test]
+    fn injects_into_user_supplied_gamemoderun_flatpak() {
+        let vars = test_vars();
+        let injected = inject_flatpak_env(
+            &os_slice(&["gamemoderun", "flatpak", "run", "app.id"]),
+            &vars,
+        )
+        .expect("gamemoderun + flatpak run is detected");
+        assert_eq!(
+            injected,
+            os_slice(&[
+                "gamemoderun",
+                "flatpak",
+                "run",
+                "--env=SOME_VAR=some value",
+                "app.id"
+            ])
+        );
+    }
+
+    #[test]
+    fn wraps_with_gamemoderun_when_available() {
+        let wrapped = maybe_wrap_gamemode(os_slice(&["game"]), true);
+        assert_eq!(wrapped, os_slice(&["gamemoderun", "game"]));
+
+        let unwrapped = maybe_wrap_gamemode(os_slice(&["game"]), false);
+        assert_eq!(unwrapped, os_slice(&["game"]));
+
+        let already = maybe_wrap_gamemode(os_slice(&["gamemoderun", "game"]), true);
+        assert_eq!(already, os_slice(&["gamemoderun", "game"]));
+
+        // Absolute paths to gamemoderun also count as already-wrapped.
+        let path_form = maybe_wrap_gamemode(os_slice(&["/usr/bin/gamemoderun", "game"]), true);
+        assert_eq!(path_form, os_slice(&["/usr/bin/gamemoderun", "game"]));
+    }
+
+    #[test]
+    fn detects_executables_on_directories() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "latencydevil-path-test-{0}-{1}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock is sane")
+                .as_nanos(),
+        ));
+        fs::create_dir_all(&dir).expect("create test dir");
+        fs::write(dir.join("gamemoderun"), "#!/bin/sh\nexec \"$@\"\n")
+            .expect("write test script");
+        fs::set_permissions(dir.join("gamemoderun"), fs::Permissions::from_mode(0o755))
+            .expect("chmod test script");
+        fs::write(dir.join("not-executable"), "data").expect("write test file");
+
+        let dirs = vec![PathBuf::from("/definitely/not/a/dir"), dir.clone()];
+        assert!(find_binary_in(&dirs, "gamemoderun"), "executable found");
+        assert!(!find_binary_in(&dirs, "not-executable"), "missing exec bit");
+        assert!(!find_binary_in(&dirs, "missing"), "absent binary");
+        assert!(!find_binary_in(&[], "gamemoderun"), "empty PATH");
+
+        fs::remove_dir_all(&dir).expect("clean up test dir");
     }
 }

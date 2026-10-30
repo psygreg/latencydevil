@@ -42,6 +42,15 @@ latencydevil -- flatpak run at.anegostudios.VintageStory
 latencydevil -- wine /path/to/game.exe
 ```
 
+### GameMode handling
+
+When `gamemoderun` is present on PATH the wrapper runs the command as
+`gamemoderun COMMAND`, so GameMode adjusts process priorities during play.
+When it is absent, only the environment variables above are injected — the
+host is presumed to manage process priorities itself. A command that already
+starts with `gamemoderun` is never double-wrapped, and `latencydevil --print`
+reports which path applies (as `#` comments).
+
 ### Flatpak handling
 
 Flatpak sandboxes drop environment variables they don't allow-list, so plain
