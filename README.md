@@ -27,6 +27,21 @@ sudo cp target/release/latencydevil /usr/local/bin/   # or anywhere on your PATH
 sudo cargo install --path .                            # alternative: ~/.cargo/bin
 ```
 
+#### Nix / NixOS
+
+Run directly using Flakes:
+
+```sh
+nix run github:psygreg/latencydevil -- --print
+```
+
+Or build locally:
+
+```sh
+nix build
+./result/bin/latencydevil --print
+```
+
 ### Usage
 
 Steam launch options:
