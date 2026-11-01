@@ -57,7 +57,7 @@ latencydevil -- flatpak run at.anegostudios.VintageStory
 latencydevil -- wine /path/to/game.exe
 ```
 
-### Known Issues
+## Known Issues
 
 - ***THE FINALS***: has momentary freezes with any low latency mode enabled, regardless if it's AMD AntiLag 2 or Nvidia Reflex. It's an upstream problem, so nothing we can do but wait. You can play the game normally with any low latency modes disabled.
 
